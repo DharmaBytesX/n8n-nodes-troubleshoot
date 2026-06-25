@@ -1,0 +1,17 @@
+{
+  "node": "n8n-nodes-troubleshoot.troubleshoot",
+  "nodeVersion": "1.0",
+  "codexVersion": "1.0",
+  "categories": [
+    "Development",
+    "IT & Operations"
+  ],
+  "resources": {
+    "credentialDocumentation": [],
+    "primaryDocumentation": [
+      {
+        "url": "https://github.com/DharmaBytesX/n8n-nodes-troubleshoot"
+      }
+    ]
+  }
+}

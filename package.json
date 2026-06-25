@@ -1,0 +1,44 @@
+{
+  "name": "n8n-nodes-troubleshoot",
+  "version": "1.0.0",
+  "description": "n8n community node for network troubleshooting: ICMP ping, DNS resolution, and TLS certificate verification",
+  "keywords": [
+    "n8n-community-node-package",
+    "n8n",
+    "troubleshoot",
+    "ping",
+    "dns",
+    "tls",
+    "network",
+    "icmp",
+    "ssl",
+    "certificate"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/DharmaBytesX/n8n-nodes-troubleshoot",
+  "author": {
+    "name": "DharmaBytesX",
+    "email": "",
+    "url": "https://github.com/DharmaBytesX"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DharmaBytesX/n8n-nodes-troubleshoot.git"
+  },
+  "bugs": {
+    "url": "https://github.com/DharmaBytesX/n8n-nodes-troubleshoot/issues"
+  },
+  "main": "index.js",
+  "files": [
+    "nodes"
+  ],
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "nodes": [
+      "nodes/Troubleshoot/Troubleshoot.node.js"
+    ]
+  },
+  "engines": {
+    "node": ">=18.10"
+  }
+}
