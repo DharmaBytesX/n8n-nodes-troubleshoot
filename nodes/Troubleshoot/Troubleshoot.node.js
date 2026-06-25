@@ -1,9 +1,4 @@
-const dnsPromises = require('dns').promises;
-const tls = require('tls');
-const { execFile } = require('child_process');
-const { promisify } = require('util');
-
-const execFileAsync = promisify(execFile);
+const net = require('net');
 
 // ----------------------------------------------------------------------------
 // Validation helpers
@@ -11,7 +6,6 @@ const execFileAsync = promisify(execFile);
 
 function isValidHost(host) {
 	if (!host || typeof host !== 'string') return false;
-	// Reject shell metacharacters and null bytes
 	return !/[;&|`$(){}[\]<>\n\r\x00]/.test(host);
 }
 
@@ -24,218 +18,172 @@ function isNonNegativeInt(n) {
 }
 
 // ----------------------------------------------------------------------------
-// Standalone helper functions (not class methods — n8n calls execute() with
-// an execution context as `this`, so `this._ping` etc would be undefined).
+// Standalone helper functions
 // ----------------------------------------------------------------------------
 
 /**
- * ICMP ping via system ping command.
- * Uses -c for count and -w for deadline timeout.
+ * TCP connectivity check — n8n Cloud blocks child_process, so no ICMP ping.
+ * Uses net.createConnection to host:port and measures RTT.
  */
-async function icmpPing(host, count, timeoutSec) {
+async function tcpPing(host, count, timeoutMs) {
 	if (!isValidHost(host)) {
 		throw new Error('Invalid host value');
 	}
 	if (!isPositiveInt(count) || count > 100) {
 		throw new Error('Ping count must be a positive integer (max 100)');
 	}
-	if (!isNonNegativeInt(timeoutSec) || timeoutSec > 300) {
-		throw new Error('Timeout must be between 0 and 300 seconds');
+	if (!isNonNegativeInt(timeoutMs) || timeoutMs > 300000) {
+		throw new Error('Timeout must be between 0 and 300000 ms');
 	}
 
-	const startTime = Date.now();
+	const results = [];
+	let successCount = 0;
+	let failCount = 0;
+	let totalRtt = 0;
+	let minRtt = Infinity;
+	let maxRtt = 0;
 
-	try {
-		// execFile avoids shell interpretation — arguments passed as array
-		const { stdout } = await execFileAsync('ping', [
-			'-c', String(count),
-			'-w', String(timeoutSec),
-			'-q',
-			host,
-		]);
-
-		const elapsed = Date.now() - startTime;
-
-		const stats = {
-			packetsTransmitted: null,
-			packetsReceived: null,
-			packetLossPercent: null,
-			rttMin: null,
-			rttAvg: null,
-			rttMax: null,
-			rttMs: null,
-		};
-
-		// Parse packet line: "3 packets transmitted, 3 packets received, 0% packet loss"
-		const packetMatch = stdout.match(
-			/(\d+)\s+packets?\s+transmitted[,\s]+(\d+)\s+packets?\s+received[,\s]+(\d+)%\s+packet loss/,
-		);
-		if (packetMatch) {
-			stats.packetsTransmitted = parseInt(packetMatch[1], 10);
-			stats.packetsReceived = parseInt(packetMatch[2], 10);
-			stats.packetLossPercent = parseInt(packetMatch[3], 10);
+	for (let i = 0; i < count; i++) {
+		const startTime = Date.now();
+		try {
+			await new Promise((resolve, reject) => {
+				const socket = new net.Socket();
+				let settled = false;
+				const settle = (fn) => {
+					if (settled) return;
+					settled = true;
+					socket.destroy();
+					fn();
+				};
+				socket.setTimeout(timeoutMs);
+				socket.on('connect', () => {
+					const rtt = Date.now() - startTime;
+					settle(() => resolve({ rtt, ip: socket.remoteAddress }));
+				});
+				socket.on('error', (err) => {
+					settle(() => reject(err));
+				});
+				socket.on('timeout', () => {
+					settle(() => reject(new Error('Connection timed out')));
+				});
+				socket.connect(80, host);
+			});
+			const rtt = Date.now() - startTime;
+			successCount++;
+			totalRtt += rtt;
+			if (rtt < minRtt) minRtt = rtt;
+			if (rtt > maxRtt) maxRtt = rtt;
+			results.push({ seq: i + 1, rtt, success: true });
+		} catch (err) {
+			failCount++;
+			results.push({ seq: i + 1, rtt: null, success: false, error: err.message });
 		}
-
-		// Parse RTT line: "round-trip min/avg/max = 10.123/12.456/15.789 ms"
-		const rttMatch = stdout.match(
-			new RegExp('(?:round-trip|rtt)\\s+min/avg/max\\s*=\\s*([0-9.]+)/([0-9.]+)/([0-9.]+)\\s*ms'),
-		);
-		if (rttMatch) {
-			stats.rttMin = parseFloat(rttMatch[1]);
-			stats.rttAvg = parseFloat(rttMatch[2]);
-			stats.rttMax = parseFloat(rttMatch[3]);
-			stats.rttMs = `${stats.rttAvg}ms`;
-		}
-
-		const success = stats.packetsReceived > 0;
-
-		return {
-			success,
-			reachable: success,
-			type: 'icmp',
-			host,
-			count,
-			timeout: timeoutSec,
-			elapsed: `${elapsed}ms`,
-			...stats,
-		};
-	} catch (error) {
-		const elapsed = Date.now() - startTime;
-		const stdout = error.stdout || '';
-		const stderr = error.stderr || '';
-
-		const packetMatch = stdout.match(
-			/(\d+)\s+packets?\s+transmitted[,\s]+(\d+)\s+packets?\s+received[,\s]+(\d+)%\s+packet loss/,
-		);
-		const stats = {
-			packetsTransmitted: packetMatch ? parseInt(packetMatch[1], 10) : null,
-			packetsReceived: packetMatch ? parseInt(packetMatch[2], 10) : null,
-			packetLossPercent: packetMatch ? parseInt(packetMatch[3], 10) : null,
-		};
-
-		const rttMatch = stdout.match(
-			new RegExp('(?:round-trip|rtt)\\s+min/avg/max\\s*=\\s*([0-9.]+)/([0-9.]+)/([0-9.]+)\\s*ms'),
-		);
-		if (rttMatch) {
-			stats.rttMin = parseFloat(rttMatch[1]);
-			stats.rttAvg = parseFloat(rttMatch[2]);
-			stats.rttMax = parseFloat(rttMatch[3]);
-		}
-
-		return {
-			success: false,
-			reachable: false,
-			type: 'icmp',
-			host,
-			count,
-			timeout: timeoutSec,
-			elapsed: `${elapsed}ms`,
-			error: `ping failed: ${stderr || stdout || error.message}`,
-			...stats,
-		};
 	}
+
+	const rttAvg = successCount > 0 ? Math.round(totalRtt / successCount) : null;
+	const lossPercent = Math.round((failCount / count) * 100);
+
+	return {
+		success: successCount > 0,
+		reachable: successCount > 0,
+		type: 'tcp',
+		host,
+		count,
+		port: 80,
+		timeout: timeoutMs,
+		packetsTransmitted: count,
+		packetsReceived: successCount,
+		packetLossPercent: lossPercent,
+		rttMin: successCount > 0 ? minRtt : null,
+		rttAvg,
+		rttMax: successCount > 0 ? maxRtt : null,
+		rttMs: rttAvg !== null ? `${rttAvg}ms` : null,
+		results,
+	};
 }
 
 /**
- * DNS resolution using Node.js dns.promises.
+ * DNS resolution via Cloudflare DNS-over-HTTPS (fetch).
+ * n8n Cloud blocks the dns module, so we use a public DoH API.
  */
-async function dnsResolve(hostname, recordType, dnsServer) {
+async function dnsResolve(hostname, recordType) {
 	if (!isValidHost(hostname)) {
 		throw new Error('Invalid hostname');
 	}
 
-	const resolver = new dnsPromises.Resolver();
-	if (dnsServer) {
-		resolver.setServers([dnsServer]);
-	}
-
-	const resolveMap = {
-		A: resolver.resolve4.bind(resolver),
-		AAAA: resolver.resolve6.bind(resolver),
-		MX: resolver.resolveMx.bind(resolver),
-		CNAME: resolver.resolveCname.bind(resolver),
-		TXT: resolver.resolveTxt.bind(resolver),
-		NS: resolver.resolveNs.bind(resolver),
-		SOA: resolver.resolveSoa.bind(resolver),
-		SRV: resolver.resolveSrv.bind(resolver),
-		PTR: resolver.resolvePtr.bind(resolver),
-		ALL: resolver.resolveAny.bind(resolver),
+	const typeMap = {
+		A: 1,
+		NS: 2,
+		CNAME: 5,
+		SOA: 6,
+		PTR: 12,
+		MX: 15,
+		TXT: 16,
+		AAAA: 28,
+		SRV: 33,
+		ALL: 255,
 	};
 
-	const resolveFn = resolveMap[recordType];
-	if (!resolveFn) {
+	const typeCode = typeMap[recordType];
+	if (!typeCode) {
 		throw new Error(`Unsupported DNS record type: ${recordType}`);
 	}
 
-	let records;
+	const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=${typeCode}`;
+
+	let data;
 	try {
-		records = await resolveFn(hostname);
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 15000);
+		const response = await fetch(url, {
+			headers: { Accept: 'application/dns-json' },
+			signal: controller.signal,
+		});
+		clearTimeout(timer);
+
+		if (!response.ok) {
+			throw new Error(`DoH API returned ${response.status}`);
+		}
+		data = await response.json();
 	} catch (err) {
 		return {
 			success: false,
-			error: `DNS ${recordType} lookup failed: ${err.message}`,
-			code: err.code,
-			query: { hostname, recordType, server: dnsServer || 'system default' },
+			error: `DNS lookup failed: ${err.message}`,
+			query: { hostname, recordType, server: 'cloudflare-dns.com' },
 		};
 	}
 
+	if (data.Status !== 0) {
+		return {
+			success: false,
+			error: `DNS lookup failed with status code ${data.Status}`,
+			code: data.Status,
+			query: { hostname, recordType, server: 'cloudflare-dns.com' },
+		};
+	}
+
+	const answers = data.Answer || [];
+	const records = answers.map((a) => ({
+		name: a.name,
+		type: a.type,
+		TTL: a.TTL,
+		data: a.data,
+	}));
+
 	return {
 		success: true,
-		query: { hostname, recordType, server: dnsServer || 'system default' },
+		query: { hostname, recordType, server: 'cloudflare-dns.com' },
 		records,
-		recordCount: Array.isArray(records) ? records.length : 1,
+		recordCount: records.length,
 	};
 }
 
 /**
- * Format a TLS certificate object for output.
+ * TLS / HTTPS connectivity check via fetch().
+ * n8n Cloud blocks the tls module, so we cannot extract certificate details.
+ * Instead we verify the HTTPS handshake succeeds and measure timing.
  */
-function formatCert(cert) {
-	if (!cert) return null;
-
-	return {
-		subject: cert.subject || {},
-		issuer: cert.issuer || {},
-		serialNumber: cert.serialNumber || '',
-		validFrom: cert.valid_from || '',
-		validTo: cert.valid_to || '',
-		fingerprint: cert.fingerprint || '',
-		fingerprint256: cert.fingerprint256 || '',
-		fingerprint512: cert.fingerprint512 || '',
-		subjectAltName: cert.subjectaltname || '',
-		bits: cert.bits || null,
-		pubkey: cert.pubkey
-			? `[${cert.pubkey.type} key, ${cert.bits || 'unknown'} bits]`
-			: null,
-	};
-}
-
-/**
- * Walk the issuer chain and return an array of summaries.
- */
-function getCertChain(cert) {
-	const chain = [];
-	let current = cert;
-	while (current) {
-		chain.push({
-			subject: current.subject || {},
-			issuer: current.issuer || {},
-			fingerprint: current.fingerprint || '',
-			validFrom: current.valid_from || '',
-			validTo: current.valid_to || '',
-		});
-		current = current.issuerCertificate;
-		if (current && chain.some((c) => c.fingerprint === current.fingerprint)) {
-			break;
-		}
-	}
-	return chain;
-}
-
-/**
- * TLS certificate verification using Node.js tls module.
- */
-async function verifyTlsCert(host, port, servername, rejectUnauthorized) {
+async function verifyTlsCert(host, port, servername) {
 	if (!isValidHost(host)) {
 		throw new Error('Invalid host value');
 	}
@@ -243,59 +191,57 @@ async function verifyTlsCert(host, port, servername, rejectUnauthorized) {
 		throw new Error('Port must be between 1 and 65535');
 	}
 
-	return new Promise((resolve) => {
-		const startTime = Date.now();
+	const url = `https://${servername || host}:${port}/`;
+	const startTime = Date.now();
 
-		const socket = tls.connect(
-			{ host, port, servername, rejectUnauthorized },
-			() => {
-				const rtt = Date.now() - startTime;
-				const cert = socket.getPeerCertificate(true);
-
-				if (!cert || Object.keys(cert).length === 0) {
-					socket.end();
-					resolve({
-						success: false,
-						error: 'No certificate received from server',
-					});
-					return;
-				}
-
-				const result = {
-					success: true,
-					rtt,
-					rttMs: `${rtt}ms`,
-					authorized: socket.authorized,
-					authorizationError: socket.authorizationError || null,
-					cipher: socket.getCipher ? socket.getCipher() : null,
-					protocol: socket.getProtocol ? socket.getProtocol() : null,
-					certificate: formatCert(cert),
-					certificateChain: getCertChain(cert),
-				};
-
-				socket.end();
-				resolve(result);
-			},
-		);
-
-		socket.setTimeout(15000);
-
-		socket.on('error', (err) => {
-			resolve({
-				success: false,
-				error: `TLS connection failed: ${err.message}`,
-				rtt: Date.now() - startTime,
-			});
+	try {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 15000);
+		const response = await fetch(url, {
+			method: 'HEAD',
+			redirect: 'manual',
+			signal: controller.signal,
 		});
+		clearTimeout(timer);
 
-		socket.on('timeout', () => {
-			socket.destroy();
-			resolve({
-				success: false,
-				error: 'TLS connection timed out',
-			});
-		});
-	});
+		const rtt = Date.now() - startTime;
+
+		return {
+			success: true,
+			rtt,
+			rttMs: `${rtt}ms`,
+			connected: true,
+			statusCode: response.status,
+			statusText: response.statusText,
+			url: response.url,
+			headers: Object.fromEntries(response.headers.entries()),
+			note: 'n8n Cloud restricts tls module access; certificate details unavailable. Connectivity and handshake verified.',
+		};
+	} catch (err) {
+		const rtt = Date.now() - startTime;
+		let errorMsg = err.message;
+
+		if (errorMsg.includes('UNABLE_TO_VERIFY_LEAF_SIGNATURE') ||
+			errorMsg.includes('UNABLE_TO_VERIFY') ||
+			errorMsg.includes('certificate')) {
+			errorMsg = `TLS certificate validation failed: ${errorMsg}`;
+		} else if (errorMsg.includes('ECONNREFUSED')) {
+			errorMsg = `Connection refused on port ${port}`;
+		} else if (errorMsg.includes('ETIMEDOUT') || errorMsg.includes('timed out')) {
+			errorMsg = `Connection timed out after ${rtt}ms`;
+		} else if (errorMsg.includes('ENOTFOUND') || errorMsg.includes('getaddrinfo')) {
+			errorMsg = `Host not found: ${host}`;
+		}
+
+		return {
+			success: false,
+			connected: false,
+			error: errorMsg,
+			rtt,
+			rttMs: `${rtt}ms`,
+			note: 'n8n Cloud restricts tls module access; certificate details unavailable.',
+		};
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -310,7 +256,7 @@ class Troubleshoot {
 		group: ['transform'],
 		version: 1,
 		description:
-			'Run network troubleshooting checks: ping, DNS resolve, TLS cert verification',
+			'Run network troubleshooting checks: TCP connectivity, DNS resolve, TLS/HTTPS verification',
 		defaults: {
 			name: 'Troubleshoot',
 		},
@@ -325,25 +271,24 @@ class Troubleshoot {
 					{
 						name: 'Ping',
 						value: 'ping',
-						description: 'ICMP ping a host',
+						description: 'TCP connectivity check to a host (port 80)',
 					},
 					{
 						name: 'DNS Resolve',
 						value: 'dnsResolve',
-						description: 'Resolve a domain name to IP addresses',
+						description: 'Resolve a domain name via DNS-over-HTTPS',
 					},
 					{
 						name: 'Verify TLS Cert',
 						value: 'verifyTlsCert',
 						description:
-							'Check TLS/SSL certificate details for a host',
+							'Verify HTTPS/TLS connectivity (handshake & response)',
 					},
 				],
 				default: 'ping',
 				description: 'Troubleshooting action to perform',
 			},
 
-			// ---- shared ----
 			{
 				displayName: 'Host',
 				name: 'host',
@@ -354,26 +299,23 @@ class Troubleshoot {
 				description: 'Hostname or IP address to target',
 			},
 
-			// ---- Ping params ----
 			{
 				displayName: 'Ping Count',
 				name: 'pingCount',
 				type: 'number',
 				default: 4,
 				displayOptions: { show: { action: ['ping'] } },
-				description: 'Number of ICMP echo requests to send (-c flag)',
+				description: 'Number of TCP connection attempts',
 			},
 			{
-				displayName: 'Timeout (seconds)',
+				displayName: 'Timeout (ms)',
 				name: 'pingTimeout',
 				type: 'number',
-				default: 10,
+				default: 5000,
 				displayOptions: { show: { action: ['ping'] } },
-				description:
-					'Maximum time in seconds to wait before ping exits (-w flag)',
+				description: 'Connection timeout per attempt in milliseconds',
 			},
 
-			// ---- DNS params ----
 			{
 				displayName: 'Record Type',
 				name: 'dnsRecordType',
@@ -393,18 +335,7 @@ class Troubleshoot {
 				],
 				default: 'A',
 			},
-			{
-				displayName: 'DNS Server',
-				name: 'dnsServer',
-				type: 'string',
-				default: '',
-				placeholder: 'e.g. 8.8.8.8',
-				displayOptions: { show: { action: ['dnsResolve'] } },
-				description:
-					'Optional custom DNS server (leave empty for system default)',
-			},
 
-			// ---- TLS params ----
 			{
 				displayName: 'Port',
 				name: 'tlsPort',
@@ -423,15 +354,6 @@ class Troubleshoot {
 				description:
 					'Server name for TLS SNI extension. Defaults to host if empty.',
 			},
-			{
-				displayName: 'Reject Unauthorized',
-				name: 'tlsRejectUnauthorized',
-				type: 'boolean',
-				default: false,
-				displayOptions: { show: { action: ['verifyTlsCert'] } },
-				description:
-					'Whether to reject unauthorized / self-signed certificates',
-			},
 		],
 	};
 
@@ -447,7 +369,7 @@ class Troubleshoot {
 			try {
 				switch (action) {
 					case 'ping':
-						result = await icmpPing(
+						result = await tcpPing(
 							host,
 							this.getNodeParameter('pingCount', i),
 							this.getNodeParameter('pingTimeout', i),
@@ -458,7 +380,6 @@ class Troubleshoot {
 						result = await dnsResolve(
 							host,
 							this.getNodeParameter('dnsRecordType', i),
-							this.getNodeParameter('dnsServer', i),
 						);
 						break;
 
@@ -467,7 +388,6 @@ class Troubleshoot {
 							host,
 							this.getNodeParameter('tlsPort', i),
 							this.getNodeParameter('tlsServername', i) || host,
-							this.getNodeParameter('tlsRejectUnauthorized', i),
 						);
 						break;
 
