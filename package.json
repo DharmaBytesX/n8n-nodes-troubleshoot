@@ -18,7 +18,7 @@
   "homepage": "https://github.com/DharmaBytesX/n8n-nodes-troubleshoot",
   "author": {
     "name": "DharmaBytesX",
-    "email": "",
+    "email": "hello@dharmabytesx.dev",
     "url": "https://github.com/DharmaBytesX"
   },
   "repository": {
@@ -30,15 +30,26 @@
   },
   "main": "index.js",
   "files": [
-    "nodes"
+    "dist"
   ],
   "n8n": {
     "n8nNodesApiVersion": 1,
     "nodes": [
-      "nodes/Troubleshoot/Troubleshoot.node.js"
+      "dist/nodes/Troubleshoot/Troubleshoot.node.js"
     ]
   },
   "engines": {
     "node": ">=18.10"
+  },
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  },
+  "devDependencies": {
+    "@n8n/node-cli": "^0.36.2"
+  },
+  "scripts": {
+    "build": "cp -r nodes dist/",
+    "lint": "n8n-node lint",
+    "lint:fix": "n8n-node lint --fix"
   }
 }
