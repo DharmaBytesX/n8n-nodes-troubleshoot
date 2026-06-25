@@ -1,253 +1,3 @@
-const net = require('net');
-
-// ----------------------------------------------------------------------------
-// Validation helpers
-// ----------------------------------------------------------------------------
-
-function isValidHost(host) {
-	if (!host || typeof host !== 'string') return false;
-	return !/[;&|`$(){}[\]<>\n\r\x00]/.test(host);
-}
-
-function isPositiveInt(n) {
-	return Number.isInteger(n) && n > 0;
-}
-
-function isNonNegativeInt(n) {
-	return Number.isInteger(n) && n >= 0;
-}
-
-// ----------------------------------------------------------------------------
-// Standalone helper functions
-// ----------------------------------------------------------------------------
-
-/**
- * TCP connectivity check — n8n Cloud blocks child_process, so no ICMP ping.
- * Uses net.createConnection to host:port and measures RTT.
- */
-async function tcpPing(host, count, timeoutMs) {
-	if (!isValidHost(host)) {
-		throw new Error('Invalid host value');
-	}
-	if (!isPositiveInt(count) || count > 100) {
-		throw new Error('Ping count must be a positive integer (max 100)');
-	}
-	if (!isNonNegativeInt(timeoutMs) || timeoutMs > 300000) {
-		throw new Error('Timeout must be between 0 and 300000 ms');
-	}
-
-	const results = [];
-	let successCount = 0;
-	let failCount = 0;
-	let totalRtt = 0;
-	let minRtt = Infinity;
-	let maxRtt = 0;
-
-	for (let i = 0; i < count; i++) {
-		const startTime = Date.now();
-		try {
-			await new Promise((resolve, reject) => {
-				const socket = new net.Socket();
-				let settled = false;
-				const settle = (fn) => {
-					if (settled) return;
-					settled = true;
-					socket.destroy();
-					fn();
-				};
-				socket.setTimeout(timeoutMs);
-				socket.on('connect', () => {
-					const rtt = Date.now() - startTime;
-					settle(() => resolve({ rtt, ip: socket.remoteAddress }));
-				});
-				socket.on('error', (err) => {
-					settle(() => reject(err));
-				});
-				socket.on('timeout', () => {
-					settle(() => reject(new Error('Connection timed out')));
-				});
-				socket.connect(80, host);
-			});
-			const rtt = Date.now() - startTime;
-			successCount++;
-			totalRtt += rtt;
-			if (rtt < minRtt) minRtt = rtt;
-			if (rtt > maxRtt) maxRtt = rtt;
-			results.push({ seq: i + 1, rtt, success: true });
-		} catch (err) {
-			failCount++;
-			results.push({ seq: i + 1, rtt: null, success: false, error: err.message });
-		}
-	}
-
-	const rttAvg = successCount > 0 ? Math.round(totalRtt / successCount) : null;
-	const lossPercent = Math.round((failCount / count) * 100);
-
-	return {
-		success: successCount > 0,
-		reachable: successCount > 0,
-		type: 'tcp',
-		host,
-		count,
-		port: 80,
-		timeout: timeoutMs,
-		packetsTransmitted: count,
-		packetsReceived: successCount,
-		packetLossPercent: lossPercent,
-		rttMin: successCount > 0 ? minRtt : null,
-		rttAvg,
-		rttMax: successCount > 0 ? maxRtt : null,
-		rttMs: rttAvg !== null ? `${rttAvg}ms` : null,
-		results,
-	};
-}
-
-/**
- * DNS resolution via Cloudflare DNS-over-HTTPS (fetch).
- * n8n Cloud blocks the dns module, so we use a public DoH API.
- */
-async function dnsResolve(hostname, recordType) {
-	if (!isValidHost(hostname)) {
-		throw new Error('Invalid hostname');
-	}
-
-	const typeMap = {
-		A: 1,
-		NS: 2,
-		CNAME: 5,
-		SOA: 6,
-		PTR: 12,
-		MX: 15,
-		TXT: 16,
-		AAAA: 28,
-		SRV: 33,
-		ALL: 255,
-	};
-
-	const typeCode = typeMap[recordType];
-	if (!typeCode) {
-		throw new Error(`Unsupported DNS record type: ${recordType}`);
-	}
-
-	const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=${typeCode}`;
-
-	let data;
-	try {
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), 15000);
-		const response = await fetch(url, {
-			headers: { Accept: 'application/dns-json' },
-			signal: controller.signal,
-		});
-		clearTimeout(timer);
-
-		if (!response.ok) {
-			throw new Error(`DoH API returned ${response.status}`);
-		}
-		data = await response.json();
-	} catch (err) {
-		return {
-			success: false,
-			error: `DNS lookup failed: ${err.message}`,
-			query: { hostname, recordType, server: 'cloudflare-dns.com' },
-		};
-	}
-
-	if (data.Status !== 0) {
-		return {
-			success: false,
-			error: `DNS lookup failed with status code ${data.Status}`,
-			code: data.Status,
-			query: { hostname, recordType, server: 'cloudflare-dns.com' },
-		};
-	}
-
-	const answers = data.Answer || [];
-	const records = answers.map((a) => ({
-		name: a.name,
-		type: a.type,
-		TTL: a.TTL,
-		data: a.data,
-	}));
-
-	return {
-		success: true,
-		query: { hostname, recordType, server: 'cloudflare-dns.com' },
-		records,
-		recordCount: records.length,
-	};
-}
-
-/**
- * TLS / HTTPS connectivity check via fetch().
- * n8n Cloud blocks the tls module, so we cannot extract certificate details.
- * Instead we verify the HTTPS handshake succeeds and measure timing.
- */
-async function verifyTlsCert(host, port, servername) {
-	if (!isValidHost(host)) {
-		throw new Error('Invalid host value');
-	}
-	if (!isPositiveInt(port) || port > 65535) {
-		throw new Error('Port must be between 1 and 65535');
-	}
-
-	const url = `https://${servername || host}:${port}/`;
-	const startTime = Date.now();
-
-	try {
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), 15000);
-		const response = await fetch(url, {
-			method: 'HEAD',
-			redirect: 'manual',
-			signal: controller.signal,
-		});
-		clearTimeout(timer);
-
-		const rtt = Date.now() - startTime;
-
-		return {
-			success: true,
-			rtt,
-			rttMs: `${rtt}ms`,
-			connected: true,
-			statusCode: response.status,
-			statusText: response.statusText,
-			url: response.url,
-			headers: Object.fromEntries(response.headers.entries()),
-			note: 'n8n Cloud restricts tls module access; certificate details unavailable. Connectivity and handshake verified.',
-		};
-	} catch (err) {
-		const rtt = Date.now() - startTime;
-		let errorMsg = err.message;
-
-		if (errorMsg.includes('UNABLE_TO_VERIFY_LEAF_SIGNATURE') ||
-			errorMsg.includes('UNABLE_TO_VERIFY') ||
-			errorMsg.includes('certificate')) {
-			errorMsg = `TLS certificate validation failed: ${errorMsg}`;
-		} else if (errorMsg.includes('ECONNREFUSED')) {
-			errorMsg = `Connection refused on port ${port}`;
-		} else if (errorMsg.includes('ETIMEDOUT') || errorMsg.includes('timed out')) {
-			errorMsg = `Connection timed out after ${rtt}ms`;
-		} else if (errorMsg.includes('ENOTFOUND') || errorMsg.includes('getaddrinfo')) {
-			errorMsg = `Host not found: ${host}`;
-		}
-
-		return {
-			success: false,
-			connected: false,
-			error: errorMsg,
-			rtt,
-			rttMs: `${rtt}ms`,
-			note: 'n8n Cloud restricts tls module access; certificate details unavailable.',
-		};
-	}
-}
-
-// ----------------------------------------------------------------------------
-// Node class
-// ----------------------------------------------------------------------------
-
 class Troubleshoot {
 	description = {
 		displayName: 'Troubleshoot',
@@ -256,7 +6,7 @@ class Troubleshoot {
 		group: ['transform'],
 		version: 1,
 		description:
-			'Run network troubleshooting checks: TCP connectivity, DNS resolve, TLS/HTTPS verification',
+			'Run network troubleshooting checks: HTTP connectivity, DNS-over-HTTPS, HTTPS handshake',
 		defaults: {
 			name: 'Troubleshoot',
 		},
@@ -271,18 +21,17 @@ class Troubleshoot {
 					{
 						name: 'Ping',
 						value: 'ping',
-						description: 'TCP connectivity check to a host (port 80)',
+						description: 'HTTP connectivity check (HEAD request, port 80)',
 					},
 					{
 						name: 'DNS Resolve',
 						value: 'dnsResolve',
-						description: 'Resolve a domain name via DNS-over-HTTPS',
+						description: 'Resolve DNS via Cloudflare DNS-over-HTTPS',
 					},
 					{
 						name: 'Verify TLS Cert',
 						value: 'verifyTlsCert',
-						description:
-							'Verify HTTPS/TLS connectivity (handshake & response)',
+						description: 'HTTPS handshake and connectivity check',
 					},
 				],
 				default: 'ping',
@@ -305,15 +54,7 @@ class Troubleshoot {
 				type: 'number',
 				default: 4,
 				displayOptions: { show: { action: ['ping'] } },
-				description: 'Number of TCP connection attempts',
-			},
-			{
-				displayName: 'Timeout (ms)',
-				name: 'pingTimeout',
-				type: 'number',
-				default: 5000,
-				displayOptions: { show: { action: ['ping'] } },
-				description: 'Connection timeout per attempt in milliseconds',
+				description: 'Number of HTTP HEAD requests to send',
 			},
 
 			{
@@ -342,7 +83,7 @@ class Troubleshoot {
 				type: 'number',
 				default: 443,
 				displayOptions: { show: { action: ['verifyTlsCert'] } },
-				description: 'Port to connect to for TLS verification',
+				description: 'HTTPS port to connect to',
 			},
 			{
 				displayName: 'Servername (SNI)',
@@ -351,8 +92,7 @@ class Troubleshoot {
 				default: '',
 				placeholder: 'e.g. google.com',
 				displayOptions: { show: { action: ['verifyTlsCert'] } },
-				description:
-					'Server name for TLS SNI extension. Defaults to host if empty.',
+				description: 'Server name for TLS SNI. Defaults to host if empty.',
 			},
 		],
 	};
@@ -369,28 +109,18 @@ class Troubleshoot {
 			try {
 				switch (action) {
 					case 'ping':
-						result = await tcpPing(
-							host,
-							this.getNodeParameter('pingCount', i),
-							this.getNodeParameter('pingTimeout', i),
-						);
+						result = await httpPing(host, this.getNodeParameter('pingCount', i));
 						break;
-
 					case 'dnsResolve':
-						result = await dnsResolve(
-							host,
-							this.getNodeParameter('dnsRecordType', i),
-						);
+						result = await dnsResolve(host, this.getNodeParameter('dnsRecordType', i));
 						break;
-
 					case 'verifyTlsCert':
-						result = await verifyTlsCert(
+						result = await verifyTls(
 							host,
 							this.getNodeParameter('tlsPort', i),
 							this.getNodeParameter('tlsServername', i) || host,
 						);
 						break;
-
 					default:
 						throw new Error(`Unknown action: ${action}`);
 				}
@@ -398,7 +128,6 @@ class Troubleshoot {
 				result = {
 					success: false,
 					error: error.message,
-					errorStack: error.stack,
 				};
 			}
 
@@ -413,6 +142,167 @@ class Troubleshoot {
 		}
 
 		return [returnData];
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — zero require(), zero setTimeout, only fetch() + basic JS
+// ---------------------------------------------------------------------------
+
+async function httpPing(host, count) {
+	if (!host || typeof host !== 'string' || host.length === 0) {
+		throw new Error('Invalid host');
+	}
+	if (!Number.isInteger(count) || count < 1 || count > 100) {
+		throw new Error('Count must be an integer between 1 and 100');
+	}
+
+	const results = [];
+	let successCount = 0;
+
+	for (let i = 0; i < count; i++) {
+		const start = Date.now();
+		try {
+			const response = await fetch(`http://${host}:80/`, {
+				method: 'HEAD',
+				redirect: 'manual',
+			});
+			const rtt = Date.now() - start;
+			successCount++;
+			results.push({ seq: i + 1, rtt, success: true, status: response.status });
+		} catch (err) {
+			results.push({ seq: i + 1, rtt: Date.now() - start, success: false, error: err.message });
+		}
+	}
+
+	return {
+		success: successCount > 0,
+		reachable: successCount > 0,
+		type: 'http',
+		host,
+		count,
+		port: 80,
+		packetsTransmitted: count,
+		packetsReceived: successCount,
+		packetLossPercent: Math.round(((count - successCount) / count) * 100),
+		results,
+	};
+}
+
+async function dnsResolve(hostname, recordType) {
+	if (!hostname || typeof hostname !== 'string' || hostname.length === 0) {
+		throw new Error('Invalid hostname');
+	}
+
+	const typeMap = {
+		A: 1,
+		NS: 2,
+		CNAME: 5,
+		SOA: 6,
+		PTR: 12,
+		MX: 15,
+		TXT: 16,
+		AAAA: 28,
+		SRV: 33,
+		ALL: 255,
+	};
+
+	const typeCode = typeMap[recordType];
+	if (!typeCode) {
+		throw new Error(`Unsupported DNS record type: ${recordType}`);
+	}
+
+	const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=${typeCode}`;
+
+	try {
+		const response = await fetch(url, {
+			headers: { Accept: 'application/dns-json' },
+		});
+
+		if (!response.ok) {
+			throw new Error(`DoH API returned ${response.status}`);
+		}
+
+		const data = await response.json();
+
+		if (data.Status !== 0) {
+			return {
+				success: false,
+				error: `DNS lookup failed with status ${data.Status}`,
+				code: data.Status,
+				query: { hostname, recordType },
+			};
+		}
+
+		const answers = data.Answer || [];
+		const records = answers.map((a) => ({
+			name: a.name,
+			type: a.type,
+			TTL: a.TTL,
+			data: a.data,
+		}));
+
+		return {
+			success: true,
+			query: { hostname, recordType },
+			records,
+			recordCount: records.length,
+		};
+	} catch (err) {
+		return {
+			success: false,
+			error: `DNS lookup failed: ${err.message}`,
+			query: { hostname, recordType },
+		};
+	}
+}
+
+async function verifyTls(host, port, servername) {
+	if (!host || typeof host !== 'string' || host.length === 0) {
+		throw new Error('Invalid host');
+	}
+	if (!Number.isInteger(port) || port < 1 || port > 65535) {
+		throw new Error('Port must be between 1 and 65535');
+	}
+
+	const url = `https://${servername || host}:${port}/`;
+	const start = Date.now();
+
+	try {
+		const response = await fetch(url, {
+			method: 'HEAD',
+			redirect: 'manual',
+		});
+		const rtt = Date.now() - start;
+
+		return {
+			success: true,
+			rtt,
+			rttMs: `${rtt}ms`,
+			connected: true,
+			statusCode: response.status,
+			statusText: response.statusText,
+			url: response.url,
+		};
+	} catch (err) {
+		const rtt = Date.now() - start;
+		let errorMsg = err.message;
+
+		if (errorMsg.includes('certificate') || errorMsg.includes('UNABLE_TO_VERIFY')) {
+			errorMsg = `TLS certificate validation failed: ${errorMsg}`;
+		} else if (errorMsg.includes('ECONNREFUSED')) {
+			errorMsg = `Connection refused on port ${port}`;
+		} else if (errorMsg.includes('ENOTFOUND') || errorMsg.includes('getaddrinfo')) {
+			errorMsg = `Host not found: ${host}`;
+		}
+
+		return {
+			success: false,
+			connected: false,
+			error: errorMsg,
+			rtt,
+			rttMs: `${rtt}ms`,
+		};
 	}
 }
 
