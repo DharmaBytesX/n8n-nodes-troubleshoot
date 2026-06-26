@@ -66,6 +66,26 @@ async function icmpPing(host, count, timeoutSec) {
 	}
 }
 
+	function extractIps(records, recordType) {
+	if (!Array.isArray(records)) return { resolvedIp: null, resolvedIps: null };
+	if (recordType === 'A') {
+		const ips = records.filter(Boolean);
+		return { resolvedIp: ips[0] || null, resolvedIps: ips };
+	}
+	if (recordType === 'AAAA') {
+		const ips = records.filter(Boolean);
+		return { resolvedIp: ips[0] || null, resolvedIps: ips };
+	}
+	if (recordType === 'ALL') {
+		const ips = records
+			.filter(r => r.type === 'A' || r.type === 'AAAA')
+			.map(r => r.address || r)
+			.filter(Boolean);
+		return { resolvedIp: ips[0] || null, resolvedIps: ips };
+	}
+	return { resolvedIp: null, resolvedIps: null };
+}
+
 async function dnsResolve(hostname, recordType, dnsServer) {
 	if (!isValidHost(hostname)) throw new Error('Invalid hostname');
 	const resolver = new dnsPromises.Resolver();
@@ -89,9 +109,10 @@ async function dnsResolve(hostname, recordType, dnsServer) {
 
 	try {
 		const records = await resolveFn(hostname);
-		return { success: true, query: { hostname, recordType, server: dnsServer || 'system default' }, records, recordCount: Array.isArray(records) ? records.length : 1 };
+		const { resolvedIp, resolvedIps } = extractIps(records, recordType);
+		return { success: true, query: { hostname, recordType, server: dnsServer || 'system default' }, records, recordCount: Array.isArray(records) ? records.length : 1, resolvedIp, resolvedIps };
 	} catch (err) {
-		return { success: false, error: `DNS ${recordType} lookup failed: ${err.message}`, code: err.code, query: { hostname, recordType, server: dnsServer || 'system default' } };
+		return { success: false, error: `DNS ${recordType} lookup failed: ${err.message}`, code: err.code, query: { hostname, recordType, server: dnsServer || 'system default' }, resolvedIp: null, resolvedIps: null };
 	}
 }
 

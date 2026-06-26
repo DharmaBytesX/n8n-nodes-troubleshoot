@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-troubleshoot",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "n8n custom node for self-hosted instances: real ICMP ping, DNS resolution, and TLS certificate verification. Not compatible with n8n Cloud.",
   "keywords": [
     "n8n",
